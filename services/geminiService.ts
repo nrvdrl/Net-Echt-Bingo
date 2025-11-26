@@ -1,9 +1,45 @@
-import { GoogleGenAI, Type } from "@google/genai";
 import { BingoItem, SubjectContext } from "../types";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const API_KEY = process.env.OPENROUTER_API_KEY || process.env.API_KEY;
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const MODEL_NAME = "google/gemini-2.0-flash-001"; // Or any other OpenRouter model
 
-const MODEL_NAME = "gemini-2.5-flash";
+/**
+ * Helper to call OpenRouter API (OpenAI Compatible)
+ */
+async function callOpenRouter(messages: any[]) {
+  if (!API_KEY) {
+    throw new Error("Missing API Key. Please set OPENROUTER_API_KEY.");
+  }
+
+  const response = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${API_KEY}`,
+      "HTTP-Referer": "https://bingo-generator.vercel.app", // Optional: Your site URL
+      "X-Title": "Bingo Generator", // Optional: Your site name
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: MODEL_NAME,
+      messages: messages,
+      response_format: { type: "json_object" } // Force JSON mode
+    })
+  });
+
+  if (!response.ok) {
+    const err = await response.text();
+    console.error("OpenRouter API Error:", err);
+    throw new Error(`API call failed: ${response.statusText}`);
+  }
+
+  const data = await response.json();
+  const content = data.choices?.[0]?.message?.content || "{}";
+  
+  // Clean markdown code blocks if present (e.g. ```json ... ```)
+  const cleanContent = content.replace(/^```json\s*/, "").replace(/\s*```$/, "");
+  return JSON.parse(cleanContent);
+}
 
 /**
  * Detects the subject and whether it requires MathJax (LaTeX) rendering.
@@ -12,47 +48,31 @@ export const detectSubject = async (
   topic: string,
   imageBase64?: string | null
 ): Promise<SubjectContext> => {
-  const parts: any[] = [];
+  
+  const messages: any[] = [
+    {
+      role: "system",
+      content: "You are a helpful assistant. Return ONLY valid JSON. Detect the school subject and if math notation (LaTeX) is required."
+    }
+  ];
+
+  const userContent: any[] = [
+    { type: "text", text: `Analyseer de input (tekst: "${topic}") en/of de afbeelding.\n\n1. Bepaal het schoolvak (bijv. Wiskunde, Geschiedenis).\n2. Zet 'isMath' op true ALLEEN als het Wiskunde is (LaTeX nodig).\n\nReturn JSON: { "subject": "Vaknaam", "isMath": boolean }` }
+  ];
 
   if (imageBase64) {
-    const [header, base64Data] = imageBase64.split(',');
-    const mimeType = header.match(/:(.*?);/)?.[1] || 'image/jpeg';
-    parts.push({
-      inlineData: { mimeType, data: base64Data }
+    userContent.push({
+      type: "image_url",
+      image_url: {
+        url: imageBase64 // OpenRouter/OpenAI accepts data URI directly
+      }
     });
   }
 
-  const prompt = `
-    Analyseer de input (tekst: "${topic}") en/of de afbeelding.
-    
-    1. Bepaal het schoolvak of onderwerp (bijv. Wiskunde, Geschiedenis, Frans, Aardrijkskunde, Biologie, Algemene Kennis).
-    2. Bepaal of het onderwerp complexe wiskundige notatie (LaTeX) vereist. 
-       - Zet 'isMath' op true ALLEEN als het vak Wiskunde is.
-       - Zet 'isMath' op false voor ALLE andere vakken (dus ook voor Natuurkunde, Scheikunde, etc.).
-
-    Return JSON.
-  `;
-
-  parts.push({ text: prompt });
+  messages.push({ role: "user", content: userContent });
 
   try {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: { parts },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            subject: { type: Type.STRING, description: "De naam van het vak in het Nederlands" },
-            isMath: { type: Type.BOOLEAN, description: "True als LaTeX nodig is, anders False" }
-          },
-          required: ["subject", "isMath"]
-        }
-      }
-    });
-
-    const result = JSON.parse(response.text || "{}");
+    const result = await callOpenRouter(messages);
     return {
       subject: result.subject || "Algemeen",
       isMath: !!result.isMath
@@ -74,101 +94,68 @@ export const generateBingoItems = async (
   mode: 'similar' | 'exact' = 'similar'
 ): Promise<BingoItem[]> => {
   
-  let userPrompt = "";
-  const parts: any[] = [];
-
-  // Add Image if present
-  if (imageBase64) {
-    const [header, base64Data] = imageBase64.split(',');
-    const mimeType = header.match(/:(.*?);/)?.[1] || 'image/jpeg';
-    parts.push({
-      inlineData: { mimeType, data: base64Data }
-    });
-  }
-
-  // Construct Prompt based on Mode and Image presence
-  if (imageBase64 && mode === 'exact') {
-    userPrompt = `
-      Je bent een assistent voor het vak ${context.subject}.
-      DOEL: Maak een lijst van PRECIES ${count} vragen/antwoorden gebaseerd op de afbeelding.
-
-      STAP 1: EXTRACTIE
-      Neem de inhoud EXACT over uit de afbeelding.
-      
-      STAP 2: AANVULLEN
-      Als er minder dan ${count} items zijn, verzin er dan bijpassende items bij.
-    `;
-  } else if (imageBase64 && mode === 'similar') {
-    userPrompt = `
-      Je bent een docent voor het vak ${context.subject}.
-      Genereer ${count} NIEUWE unieke items die qua stijl en niveau lijken op de afbeelding.
-    `;
-  } else {
-    userPrompt = `
-      Je bent een docent voor het vak ${context.subject}.
-      Onderwerp: "${topicInput}".
-      Genereer precies ${count} unieke items (vraag + antwoord) voor een Bingo spel.
-    `;
-  }
-
-  // Formatting instructions based on Subject Type
+  // 1. Construct System Prompt
   let formatInstruction = "";
   if (context.isMath) {
     formatInstruction = `
       NOTATIE (WISKUNDE):
       - Gebruik LaTeX code voor symbolen in zowel 'problem' als 'answer'.
-      - GEEN dollartekens.
+      - GEEN dollartekens ($).
       - Gebruik \\times voor keer, \\frac{a}{b} voor breuken.
-      - Houd de 'answer' kort en bondig.
     `;
   } else {
     formatInstruction = `
       NOTATIE (TEKST):
       - Gebruik GEEN LaTeX. Gewone tekst.
-      - 'problem': De vraag of omschrijving die de leraar voorleest.
-      - 'answer': Het KORTE antwoord (max 1-4 woorden) dat in een klein bingo-vakje past.
-      - Voorbeeld Geschiedenis: problem="In welk jaar begon WO2?", answer="1939".
-      - Voorbeeld Frans: problem="Vertaal 'hond'", answer="Le chien".
+      - 'problem': De vraag/omschrijving die de leraar voorleest.
+      - 'answer': Het KORTE antwoord (1-4 woorden).
     `;
   }
 
-  const systemInstruction = `
+  const systemMessage = `
+    Je bent een docent voor het vak ${context.subject}.
     Genereer output voor een Bingo spel.
-    
     ${formatInstruction}
-
     Variatie: Zorg voor minimaal 13 unieke antwoorden.
-    Output alleen JSON array.
+    
+    IMPORTANT: Return a JSON Object with a property "items" containing an array of objects.
+    Example: { "items": [{ "problem": "...", "answer": "..." }] }
   `;
 
-  parts.push({ text: userPrompt + systemInstruction });
+  // 2. Construct User Prompt
+  let userPromptText = "";
+  if (imageBase64 && mode === 'exact') {
+    userPromptText = `Maak een lijst van PRECIES ${count} items. EXTRACTIE: Neem inhoud EXACT over uit de afbeelding. Vul aan indien te weinig.`;
+  } else if (imageBase64 && mode === 'similar') {
+    userPromptText = `Genereer ${count} NIEUWE unieke items die qua stijl en niveau lijken op de afbeelding.`;
+  } else {
+    userPromptText = `Onderwerp: "${topicInput}". Genereer precies ${count} unieke items (vraag + antwoord).`;
+  }
+
+  const userContent: any[] = [{ type: "text", text: userPromptText }];
+  
+  if (imageBase64) {
+    userContent.push({
+      type: "image_url",
+      image_url: { url: imageBase64 }
+    });
+  }
+
+  const messages = [
+    { role: "system", content: systemMessage },
+    { role: "user", content: userContent }
+  ];
 
   try {
-    const response = await ai.models.generateContent({
-      model: MODEL_NAME,
-      contents: { parts },
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              problem: { type: Type.STRING, description: "De vraag/omschrijving voor de lijst." },
-              answer: { type: Type.STRING, description: "Het antwoord voor op de kaart." },
-            },
-            required: ["problem", "answer"],
-          },
-        },
-      },
-    });
-
-    const rawData = JSON.parse(response.text || "[]");
+    const rawData = await callOpenRouter(messages);
     
-    return rawData.map((item: any, index: number) => ({
+    // Handle wrapped object { items: [...] } or direct array (fallback)
+    const itemsArray = Array.isArray(rawData) ? rawData : (rawData.items || []);
+
+    return itemsArray.map((item: any, index: number) => ({
       id: `item-${index}`,
-      problem: item.problem,
-      answer: item.answer,
+      problem: item.problem || "Fout",
+      answer: item.answer || "Fout",
     }));
 
   } catch (error) {
